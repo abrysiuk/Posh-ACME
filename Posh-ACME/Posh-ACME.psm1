@@ -5,7 +5,7 @@
 # with .NET 4.6.1, but only if the app is compiled to support it (which PowerShell is not).
 # So it only loads properly on .NET 4.7.1 or later which is also the minimum version we need
 # to fully support ECC based certs. Any version of .NET Core should already work.
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
+if (-not $PSEdition -or $PSEdition -eq 'Desktop') {
     # https://docs.microsoft.com/en-us/dotnet/framework/migration-guide/how-to-determine-which-versions-are-installed#to-check-for-a-minimum-required-net-framework-version-by-querying-the-registry-in-powershell-net-framework-45-and-later
     $netBuild = (Get-ItemProperty "HKLM:SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full").Release
     if ($netBuild -ge 461308) { <# 4.7.1+ - all good #> }
@@ -16,6 +16,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
         elseif ($netBuild -ge 393295) { $netVer = '4.6' }
         elseif ($netBuild -ge 379893) { $netVer = '4.5.2' }
         elseif ($netBuild -ge 378675) { $netVer = '4.5.1' }
+        elseif ($netBuild -ge 378389) { $netVer = '4.5' }
         Write-Warning "**********************************************************************"
         Write-Warning "Insufficient .NET version. Found .NET $netVer (build $netBuild)."
         Write-Warning ".NET 4.7.1 or later is required to ensure proper functionality."
@@ -24,8 +25,8 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
 }
 
 # Get public and private function definition files.
-$Public  = @( Get-ChildItem -Path $PSScriptRoot\Public\*.ps1 -ErrorAction SilentlyContinue )
-$Private = @( Get-ChildItem -Path $PSScriptRoot\Private\*.ps1 -ErrorAction SilentlyContinue )
+$Public  = @( Get-ChildItem -Path $PSScriptRoot\Public\*.ps1 -ErrorAction Ignore )
+$Private = @( Get-ChildItem -Path $PSScriptRoot\Private\*.ps1 -ErrorAction Ignore )
 
 # Dot source the files
 Foreach($import in @($Public + $Private))
@@ -37,17 +38,37 @@ Foreach($import in @($Public + $Private))
     }
 }
 
-# Export everything in the public folder
-Export-ModuleMember -Function $Public.Basename
-
 # setup some module wide variables
 $script:WellKnownDirs = @{
-    LE_PROD = 'https://acme-v02.api.letsencrypt.org/directory';
-    LE_STAGE = 'https://acme-staging-v02.api.letsencrypt.org/directory';
+    LE_PROD = 'https://acme-v02.api.letsencrypt.org/directory'
+    LE_STAGE = 'https://acme-staging-v02.api.letsencrypt.org/directory'
+    BUYPASS_PROD = 'https://api.buypass.com/acme/directory'
+    BUYPASS_TEST = 'https://api.test4.buypass.no/acme/directory'
+    ZEROSSL_PROD = 'https://acme.zerossl.com/v2/DV90'
+    GOOGLE_PROD = 'https://dv.acme-v02.api.pki.goog/directory'
+    GOOGLE_STAGE = 'https://dv.acme-v02.test-api.pki.goog/directory'
+    SSLCOM_RSA = 'https://acme.ssl.com/sslcom-dv-rsa'
+    SSLCOM_ECC = 'https://acme.ssl.com/sslcom-dv-ecc'
 }
 $script:HEADER_NONCE = 'Replay-Nonce'
-$script:USER_AGENT = "Posh-ACME/2.9.0 PowerShell/$($PSVersionTable.PSVersion)"
+$script:USER_AGENT = "Posh-ACME/4.26.0 PowerShell/$($PSVersionTable.PSVersion)"
 $script:COMMON_HEADERS = @{'Accept-Language'='en-us,en;q=0.5'}
+
+# Add an appropriate platform to the user-agent if possible
+if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
+    $script:USER_AGENT += " Platform/Windows"
+} elseif ($IsLinux) {
+    $script:USER_AGENT += " Platform/Linux"
+} elseif ($IsMacOs) {
+    $script:USER_AGENT += " Platform/MacOS"
+} else {
+    $script:USER_AGENT += " Platform/Unknown"
+}
+
+# create an HttpClient object we can use for async telemetry pings that won't
+# block waiting for a timeout if the server is unreachable.
+$script:TelemetryClient = [System.Net.Http.HttpClient]::new()
+$script:TelemetryClient.DefaultRequestHeaders.Add('User-Agent', $script:USER_AGENT)
 
 # Invoke-WebRequest and Invoke-RestMethod on PowerShell 5.1 both use
 # IE's DOM parser by default which gives you some nice things that we
@@ -65,26 +86,13 @@ if ('UseBasicParsing' -in (Get-Command Invoke-WebRequest).Parameters.Keys) {
     $script:UseBasic.UseBasicParsing = $true
 }
 
-# setup the DnsPlugin argument completers
-# https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/register-argumentcompleter?view=powershell-5.1
-Register-ArgumentCompleter -CommandName 'New-PACertificate','Submit-ChallengeValidation' `
-    -ParameterName 'DnsPlugin' -ScriptBlock {
-    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameter)
+Import-PluginDetail
 
-    $names = (Get-ChildItem -Path $PSScriptRoot\DnsPlugins\*.ps1 -Exclude '_Example.ps1').BaseName
-    $names | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
-        [Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
-    }
-}
-Register-ArgumentCompleter -CommandName 'Publish-DnsChallenge','Unpublish-DnsChallenge','Save-DnsChallenge' `
-    -ParameterName 'Plugin' -ScriptBlock {
-    param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameter)
+Register-ArgCompleters
 
-    $names = (Get-ChildItem -Path $PSScriptRoot\DnsPlugins\*.ps1 -Exclude '_Example.ps1').BaseName
-    $names | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
-        [Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
-    }
-}
-
+# Get-PAAuthorizations was renamed to Get-PAAuthorization in 4.x. But we'll add
+# an alias to the old version so that we don't break scripts since it functions
+# the same.
+Set-Alias Get-PAAuthorizations -Value Get-PAAuthorization
 
 Import-PAConfig

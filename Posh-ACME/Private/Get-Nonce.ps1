@@ -7,13 +7,13 @@ function Get-Nonce {
         [string]$NewNonceUrl
     )
 
-    # https://tools.ietf.org/html/draft-ietf-acme-acme-12#section-7.2
+    # https://tools.ietf.org/html/rfc8555#section-7.2
 
     Process {
 
         # if there was no Url passed in, check if there's a saved one
-        if (!$NewNonceUrl) {
-            if (!$script:Dir -or !$script:Dir.newNonce) {
+        if (-not $NewNonceUrl) {
+            if (-not $script:Dir -or -not $script:Dir.newNonce) {
                 throw "No NewNonceUrl passed in or saved on current PAServer."
             } else {
                 $NewNonceUrl = $script:Dir.newNonce

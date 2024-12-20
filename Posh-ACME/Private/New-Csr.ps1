@@ -7,19 +7,18 @@ function New-Csr {
     )
 
     # Make sure we have an account configured
-    if (!(Get-PAAccount)) {
+    if (-not (Get-PAAccount)) {
         throw "No ACME account configured. Run Set-PAAccount or New-PAAccount first."
     }
 
     # Order verification should have already been taken care of
-    $orderFolder = Join-Path $script:AcctFolder $Order.MainDomain.Replace('*','!')
-    $keyFile = Join-Path $orderFolder 'cert.key'
-    $reqFile = Join-Path $orderFolder 'request.csr'
+    $keyFile = Join-Path $Order.Folder 'cert.key'
+    $reqFile = Join-Path $Order.Folder 'request.csr'
 
     # Check for an existing key
     if (Test-Path $keyFile -PathType Leaf) {
 
-        $keyPair = Import-Pem $keyFile
+        $keyPair = Import-Pem -InputFile $keyFile
 
         if ($Order.KeyLength -notlike 'ec-*') {
             $sigAlgo = 'SHA256WITHRSA'
@@ -35,13 +34,12 @@ function New-Csr {
 
         Write-Verbose "Creating new private key for the certificate request."
 
-        $sRandom = New-Object Org.BouncyCastle.Security.SecureRandom
+        $sRandom = [Org.BouncyCastle.Security.SecureRandom]::new()
 
         if ($Order.KeyLength -like 'ec-*') {
 
             # EC key
             Write-Debug "Creating BC EC keypair of type $($Order.KeyLength)"
-            $isRSA = $false
             $keySize = [int]$Order.KeyLength.Substring(3)
             $curveOid = [Org.BouncyCastle.Asn1.Nist.NistNamedCurves]::GetOid("P-$keySize")
 
@@ -49,8 +47,8 @@ function New-Csr {
             elseif ($keySize -eq 384) { $sigAlgo = 'SHA384WITHECDSA' }
             elseif ($keySize -eq 521) { $sigAlgo = 'SHA512WITHECDSA' }
 
-            $ecGen = New-Object Org.BouncyCastle.Crypto.Generators.ECKeyPairGenerator
-            $genParam = New-Object Org.BouncyCastle.Crypto.Parameters.ECKeyGenerationParameters -ArgumentList $curveOid,$sRandom
+            $ecGen = [Org.BouncyCastle.Crypto.Generators.ECKeyPairGenerator]::new()
+            $genParam = [Org.BouncyCastle.Crypto.Parameters.ECKeyGenerationParameters]::new($curveOid,$sRandom)
             $ecGen.Init($genParam)
             $keyPair = $ecGen.GenerateKeyPair()
 
@@ -58,12 +56,11 @@ function New-Csr {
 
             # RSA key
             Write-Debug "Creating BC RSA keypair of type $($Order.KeyLength)"
-            $isRSA = $true
             $keySize = [int]$Order.KeyLength
             $sigAlgo = 'SHA256WITHRSA'
 
-            $rsaGen = New-Object Org.BouncyCastle.Crypto.Generators.RsaKeyPairGenerator
-            $genParam = New-Object Org.BouncyCastle.Crypto.KeyGenerationParameters -ArgumentList $sRandom,$keySize
+            $rsaGen = [Org.BouncyCastle.Crypto.Generators.RsaKeyPairGenerator]::new()
+            $genParam = [Org.BouncyCastle.Crypto.KeyGenerationParameters]::new($sRandom,$keySize)
             $rsaGen.Init($genParam)
             $keyPair = $rsaGen.GenerateKeyPair()
 
@@ -77,20 +74,46 @@ function New-Csr {
     # start building the cert request
 
     # create the subject
-    $subject = New-Object Org.BouncyCastle.Asn1.X509.X509Name("CN=$($Order.MainDomain)")
+    if ($Order.Subject) {
+        $subject = [Org.BouncyCastle.Asn1.X509.X509Name]::new($Order.Subject)
+    } elseif ($Order.MainDomain.Length -le 64) {
+        $subject = [Org.BouncyCastle.Asn1.X509.X509Name]::new("CN=$($Order.MainDomain)")
+    } else {
+        # CN's longer than 64 characters are invalid in a CSR, so just leave it empty
+        # because the CN value is deprecated anyway
+        $subject = [Org.BouncyCastle.Asn1.X509.X509Name]::GetInstance([Org.BouncyCastle.Asn1.DerSequence]::new())
+    }
 
     # create a .NET Dictionary to hold our extensions because that's what BouncyCastle needs
     $extDict = New-Object 'Collections.Generic.Dictionary[Org.BouncyCastle.Asn1.DerObjectIdentifier,Org.BouncyCastle.Asn1.X509.X509Extension]'
 
     # create the extensions we care about
     $basicConstraints = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($false, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.BasicConstraints($false))))
-    $keyUsage = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($true, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.KeyUsage([Org.BouncyCastle.Asn1.X509.KeyUsage]::DigitalSignature -bor [Org.BouncyCastle.Asn1.X509.KeyUsage]::KeyEncipherment))))
+    if ($Order.KeyLength -like 'ec-*') {
+        # Only DigitalSignature on ECC certs because KeyEncipherment not supported
+        $keyUsage = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($true, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.KeyUsage([Org.BouncyCastle.Asn1.X509.KeyUsage]::DigitalSignature))))
+    } else {
+        # DigitalSignature and KeyEncipherment on RSA certs
+        $keyUsage = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($true, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.KeyUsage([Org.BouncyCastle.Asn1.X509.KeyUsage]::DigitalSignature -bor [Org.BouncyCastle.Asn1.X509.KeyUsage]::KeyEncipherment))))
+    }
+    # Client + Server Authentication
     $extKeyUsage = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($false, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.ExtendedKeyUsage([Org.BouncyCastle.Asn1.X509.KeyPurposeID]::IdKPServerAuth, [Org.BouncyCastle.Asn1.X509.KeyPurposeID]::IdKPClientAuth))))
-    $genNames = @()
-    $allSANs = @($Order.MainDomain); if ($Order.SANs.Count -gt 0) { $allSANs += @($Order.SANs) }
-    foreach ($name in $allSANs) { $genNames += New-Object Org.BouncyCastle.Asn1.X509.GeneralName([Org.BouncyCastle.Asn1.X509.GeneralName]::DnsName, $name) }
-    $sans = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($false, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.GeneralNames(@(,$genNames)))))
     $ski = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($false, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.X509.Extension.SubjectKeyIdentifierStructure($keyPair.Public))))
+
+    # create SANs based on the identifier types
+    $genNames = @()
+    $Order.identifiers | ForEach-Object {
+        if ($_.type -eq 'dns') {
+            $genNames += New-Object Org.BouncyCastle.Asn1.X509.GeneralName([Org.BouncyCastle.Asn1.X509.GeneralName]::DnsName, $_.value)
+        }
+        elseif ($_.type -eq 'ip') {
+            $genNames += New-Object Org.BouncyCastle.Asn1.X509.GeneralName([Org.BouncyCastle.Asn1.X509.GeneralName]::IPAddress, $_.value)
+        }
+        else {
+            Write-Warning "Skipping unexpected identifier type '$($_.type)' with value '$($_.value)'."
+        }
+    }
+    $sans = New-Object Org.BouncyCastle.Asn1.X509.X509Extension($false, (New-Object Org.BouncyCastle.Asn1.DerOctetString(New-Object Org.BouncyCastle.Asn1.X509.GeneralNames(@(,$genNames)))))
 
     # add them to a DerSet object
     $extDict.Add([Org.BouncyCastle.Asn1.X509.X509Extensions]::BasicConstraints, $basicConstraints)

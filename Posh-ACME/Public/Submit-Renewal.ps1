@@ -3,25 +3,27 @@ function Submit-Renewal {
     param(
         [Parameter(ParameterSetName='Specific',Position=0,ValueFromPipeline,ValueFromPipelineByPropertyName)]
         [string]$MainDomain,
+        [Parameter(ParameterSetName='Specific',Position=1,ValueFromPipelineByPropertyName)]
+        [ValidateScript({Test-ValidFriendlyName $_ -ThrowOnFail})]
+        [string]$Name,
         [Parameter(ParameterSetName='AllOrders',Mandatory)]
         [switch]$AllOrders,
         [Parameter(ParameterSetName='AllAccounts',Mandatory)]
         [switch]$AllAccounts,
-        [switch]$NewKey,
         [switch]$Force,
-        [switch]$NoSkipManualDns
+        [switch]$NoSkipManualDns,
+        [hashtable]$PluginArgs
     )
 
     Begin {
-        # import existing plugin args if we're only dealing with the current account
+        # make sure we have an account if renewing all or a specific order
         if ($PSCmdlet.ParameterSetName -in 'Specific','AllOrders') {
-
-            # Make sure we have an account configured
-            if (!(Get-PAAccount)) {
-                throw "No ACME account configured. Run Set-PAAccount or New-PAAccount first."
+            try {
+                if (-not (Get-PAAccount)) {
+                    throw "No ACME account configured. Run Set-PAAccount or New-PAAccount first."
+                }
             }
-
-            $pluginArgs = Merge-PluginArgs
+            catch { $PSCmdlet.ThrowTerminatingError($_) }
         }
     }
 
@@ -31,61 +33,76 @@ function Submit-Renewal {
 
             'Specific' {
 
-                # grab the order from explicit parameters or the current memory copy
-                if (!$MainDomain) {
-                    if (!$script:Order -or !$script:Order.MainDomain) {
-                        throw "No ACME order configured. Run Set-PAOrder or specify a MainDomain."
-                    }
-                    $order = $script:Order
-                } else {
-                    # even if they specified the order explicitly, we may still be updating the
-                    # "current" order. So figure that out because we don't want to read from disk
-                    # if we don't have to
-                    if ($script:Order -and $script:Order.MainDomain -and $script:Order.MainDomain -eq $MainDomain) {
-                        $order = $script:Order
-                    } else {
-                        $order = Get-PAOrder $MainDomain
-                    }
+                # grab the order object
+                $orderArgs = @{}
+                if ($MainDomain) { $orderArgs.MainDomain = $MainDomain }
+                if ($Name)       { $orderArgs.Name       = $Name }
+                if (-not ($order = Get-PAOrder @orderArgs)) {
+                    try { throw "No order found for the specified parameters." }
+                    catch { $PSCmdlet.ThrowTerminatingError($_) }
+                }
+
+                # trigger an ARI check if supported
+                if (-not (Get-PAServer).DisableARI -and (Get-PAServer).renewalInfo) {
+                    Update-PAOrder -Order $order
                 }
 
                 # skip if the renewal window hasn't been reached and no -Force
-                if (!$Force -and $order.RenewAfter -and (Get-DateTimeOffsetNow) -lt ([DateTimeOffset]::Parse($order.RenewAfter))) {
-                    Write-Warning "Order for $($order.MainDomain) is not recommended for renewal yet. Use -Force to override."
+                if (-not $Force -and $null -ne $order.RenewAfter -and (Get-DateTimeOffsetNow) -lt ([DateTimeOffset]::Parse($order.RenewAfter))) {
+                    Write-Warning "Order '$($order.Name)' is not recommended for renewal yet. Use -Force to override."
                     return
                 }
 
-                # skip orders with a Manual DNS plugin
-                if (!$NoSkipManualDns -and 'Manual' -in @($order.DnsPlugin)) {
-                    Write-Warning "Skipping renewal for order $($order.MainDomain) due to Manual DNS plugin. Use -NoSkipManualDns to avoid this."
+                # skip orders with no plugin (likely because they were created using custom processes)
+                if ($null -eq $order.Plugin) {
+                    Write-Warning "Skipping renewal for order '$($order.Name)' due to null plugin."
                     return
                 }
 
-                Write-Verbose "Renewing certificate for order $($order.MainDomain)"
+                # skip orders with a Manual DNS plugin by default because they require interactivity
+                if (-not $NoSkipManualDns -and 'Manual' -in @($order.Plugin)) {
+                    Write-Warning "Skipping renewal for order '$($order.Name)' due to Manual DNS plugin. Use -NoSkipManualDns to avoid this."
+                    return
+                }
+
+                Write-Verbose "Renewing certificate for order '$($order.Name)'"
+
+                # If new PluginArgs were specified, store these now.
+                if ($PluginArgs) {
+                    Export-PluginArgs -Order $order -PluginArgs $PluginArgs
+                }
 
                 # Build the parameter list we're going to send to New-PACertificate
                 $certParams = @{}
-                $certParams.Domain = @($order.MainDomain);
-                if ($order.SANs.Count -gt 0) { $certParams.Domain += @($order.SANs) }
-                $certParams.NewCertKey = $NewKey.IsPresent
-                $certParams.DnsPlugin = $order.DnsPlugin
-                $certParams.PluginArgs = $pluginArgs
-                $certParams.OCSPMustStaple = $order.OCSPMustStaple
-                $certParams.Force = $Force.IsPresent
-                $certParams.DnsSleep = $order.DnsSleep
-                $certParams.ValidationTimeout = $order.ValidationTimeout
 
-                # Add the new (as of 1.2) fields if they exist.
-                # The property checks can be removed once enough time passes
-                # to assume the majority of people have done renewals against 1.2.
-                if ('Install' -in $order.PSObject.Properties.name -and (Test-WinOnly)) {
-                    $certParams.Install = $order.Install
+                if ([String]::IsNullOrWhiteSpace($order.CSRBase64Url)) {
+                    # FromScratch param set
+                    $certParams.Domain         = @($order.MainDomain);
+                    if ($order.SANs.Count -gt 0) { $certParams.Domain += @($order.SANs) }
+                    $certParams.CertKeyLength  = $order.KeyLength
+                    $certParams.AlwaysNewKey   = $order.AlwaysNewKey
+                    $certParams.OCSPMustStaple = $order.OCSPMustStaple
+                    $certParams.FriendlyName   = $order.FriendlyName
+                    $certParams.PfxPass        = $order.PfxPass
+                    if (Test-WinOnly) { $certParams.Install = $order.Install }
+                } else {
+                    # FromCSR param set
+                    $reqPath = Join-Path $order.Folder "request.csr"
+                    $certParams.CSRPath = $reqPath
                 }
-                if ('FriendlyName' -in $order.PSObject.Properties.name) {
-                    $certParams.FriendlyName = $order.FriendlyName
-                }
-                if ('PfxPass' -in $order.PSObject.Properties.name) {
-                    $certParams.PfxPass = $order.PfxPass
-                }
+
+                # common params
+                $certParams.Name                = $order.Name
+                $certParams.Plugin              = $order.Plugin
+                $certParams.PluginArgs          = $order | Get-PAPluginArgs
+                $certParams.DnsAlias            = $order.DnsAlias
+                $certParams.UseSerialValidation = $order.UseSerialValidation
+                $certParams.Force               = $Force.IsPresent
+                $certParams.DnsSleep            = $order.DnsSleep
+                $certParams.ValidationTimeout   = $order.ValidationTimeout
+                $certParams.PreferredChain      = $order.PreferredChain
+
+                if ($order.LifetimeDays -gt 0) { $certParams.LifetimeDays = $order.LifetimeDays }
 
                 # now we just have to request a new cert using all of the old parameters
                 New-PACertificate @certParams
@@ -95,19 +112,26 @@ function Submit-Renewal {
 
             'AllOrders' {
 
-                # get the list of all completed (valid) orders
-                $orders = @(Get-PAOrder -List -Refresh | Where-Object { $_.status -eq 'valid' })
-
-                # remove the ones that are ready for renewal unless -Force was used
-                if (!$Force) {
-                    $orders = @($orders | Where-Object { (Get-DateTimeOffsetNow) -ge ([DateTimeOffset]::Parse($_.RenewAfter)) })
-                }
+                # get all existing orders on this account
+                $orders = @(Get-PAOrder -List -Refresh)
 
                 if ($orders.Count -gt 0) {
+
+                    $renewParams = @{
+                        Force = $Force.IsPresent
+                        NoSkipManualDns = $NoSkipManualDns.IsPresent
+                    }
+
+                    # If new PluginArgs were specified use them
+                    if ($PluginArgs) {
+                        $renewParams.PluginArgs = $PluginArgs
+                    }
+
                     # recurse to renew these orders
-                    $orders | Submit-Renewal -NewKey:$NewKey.IsPresent -Force:$Force.IsPresent
+                    $orders | Submit-Renewal @renewParams
+
                 } else {
-                    Write-Verbose "No renewable orders found for account $($script:Acct.id)."
+                    Write-Verbose "No orders found for account $($script:Acct.id)."
                 }
 
                 break
@@ -119,18 +143,30 @@ function Submit-Renewal {
                 $oldAcct = Get-PAAccount
 
                 # get the list of valid accounts
-                $accounts = Get-PAAccount -List -Refresh | Where-Object { $_.status -eq 'valid' }
+                $accounts = Get-PAAccount -List -Status 'valid' -Refresh
 
                 foreach ($acct in $accounts) {
+
                     # set it as current
                     $acct | Set-PAAccount
 
+                    $renewParams = @{
+                        AllOrders = $true
+                        Force = $Force.IsPresent
+                        NoSkipManualDns = $NoSkipManualDns.IsPresent
+                    }
+
+                    # If new PluginArgs were specified use them
+                    if ($PluginArgs) {
+                        $renewParams.PluginArgs = $PluginArgs
+                    }
+
                     # recurse to renew all orders on it
-                    Submit-Renewal -AllOrders -NewKey:$NewKey.IsPresent -Force:$Force.IsPresent
+                    Submit-Renewal @renewParams
                 }
 
                 # restore the old current account
-                if ($oldAcct) { $oldAccount | Set-PAAccount }
+                if ($oldAcct) { $oldAcct | Set-PAAccount }
 
                 break
             }
@@ -138,69 +174,4 @@ function Submit-Renewal {
         }
 
     }
-
-
-
-
-
-    <#
-    .SYNOPSIS
-        Renew one or more certificates.
-
-    .DESCRIPTION
-        This function allows you to renew one more more previously completed certificate orders. You can choose to renew a specific order or set of orders, all orders for the current account, or all orders for all accounts.
-
-    .PARAMETER MainDomain
-        The primary domain associated with an order. This is the domain that goes in the certificate's subject.
-
-    .PARAMETER AllOrders
-        If specified, renew all valid orders on the current account. Orders that have not reached the renewal window will be skipped unless -Force is used.
-
-    .PARAMETER AllAccounts
-        If specified, renew all valid orders on all valid accounts in this profile. Orders that have not reached the renewal window will be skipped unless -Force is used.
-
-    .PARAMETER NewKey
-        If specified, a new private key will be generated for the certificate renewal. Otherwise, the old key is re-used. This is useful if you believe the current key has been compromised.
-
-    .PARAMETER Force
-        If specified, an order that hasn't reached its renewal window will not throw an error and will not be skipped when using either of the -All parameters.
-
-    .PARAMETER NoSkipManualDns
-        If specified, orders that utilize the Manual DNS plugin will not be skipped and user interaction may be required to complete the process. Otherwise, orders that utilize the Manual DNS plugin will be skipped.
-
-    .EXAMPLE
-        Submit-Renewal
-
-        Renew the current order on the current account.
-
-    .EXAMPLE
-        Submit-Renewal -Force
-
-        Renew the current order on the current account even if it hasn't reached its suggested renewal window.
-
-    .EXAMPLE
-        Submit-Renewal -AllOrders
-
-        Renew all valid orders on the current account that have reached their suggested renewal window.
-
-    .EXAMPLE
-        Submit-Renewal -AllAccounts
-
-        Renew all valid orders on all valid accounts that have reached their suggested renewal window.
-
-    .EXAMPLE
-        Submit-Renewal site1.example.com -NewKey -Force
-
-        Renew the order for the specified site regardless of its renewal window and generate a new private key.
-
-    .LINK
-        Project: https://github.com/rmbolger/Posh-ACME
-
-    .LINK
-        New-PACertificate
-
-    .LINK
-        Get-PAOrder
-
-    #>
 }
